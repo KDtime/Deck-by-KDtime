@@ -50,7 +50,7 @@ APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path
 APP_NAME = "SkyDeck"
 APP_AUTHOR = "KDtime"
 APP_TITLE = "%s by %s" % (APP_NAME, APP_AUTHOR)
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 EXE_NAME = APP_NAME + ".exe"
 # Репозиторий GitHub с файлом-обновлением, формат "логин/репозиторий" (или "update_repo" в конфиге).
 # Пусто - проверка обновлений отключена.
@@ -77,6 +77,7 @@ DEFAULT_CFG = {
     "g_zones": {"start": 2.0, "target": 3.0, "limit": 4.5, "good": "#50e682", "bad": "#ff6446"},
     "auto_update_check": True,
     "update_repo": "",
+    "panel_size": [0, 0],         # размер панели настройки (0 - по содержимому)
     "poll_ms": 25,
     "poll_ms_idle": 1000,
     "layout": {},                # ключ -> [x, y, w, h] в долях экрана
@@ -919,6 +920,11 @@ class Panel(QFrame):
             "border-radius:4px;padding:2px 4px;font:12px Consolas;}"
             "QComboBox QAbstractItemView{background:#1d2b3d;color:#cfe6ff;selection-background-color:#27405c;}")
         cfg = ov.cfg
+        self.setMouseTracking(True)
+        self._rs = None                       # состояние растягивания: (старт курсора, старый размер, края)
+        ps = cfg.get("panel_size") or [0, 0]
+        self.user_w = int(ps[0]) or None
+        self.user_h = int(ps[1]) or None
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 8, 12, 10)
         root.setSpacing(6)
@@ -930,6 +936,7 @@ class Panel(QFrame):
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(2)
         self.boxes = {}
+        self.grid, self._cols = grid, 4
         for n, (key, title) in enumerate(ov.menu_items):
             cb = QCheckBox(title)
             cb.setChecked(ov.is_visible(key))
@@ -980,20 +987,20 @@ class Panel(QFrame):
         self.more_scroll.setWidgetResizable(True)
         self.more_scroll.setFrameShape(QFrame.NoFrame)
         self.more_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.more_scroll.setMaximumHeight(max(260, int(ov.height() * 0.40)))
         self.more_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}"
                                        "QScrollArea > QWidget > QWidget{background:transparent;}")
         self.more_scroll.hide()
-        root.addWidget(self.more_scroll)
+        root.addWidget(self.more_scroll, 10)
         self.msg = QLabel("")
         self.msg.setWordWrap(True)
         self.msg.setStyleSheet("color:#ffdc5a;font:11px Consolas;")
         root.addWidget(self.msg)
+        root.addStretch(1)
         foot = self._note("%s  v%s" % (APP_TITLE, APP_VERSION))
         foot.setAlignment(Qt.AlignRight)
         root.addWidget(foot)
-        self.adjustSize()
         self._drag = None
+        self.fit()
 
     # -- помощники --
     def _note(self, text):
@@ -1017,8 +1024,27 @@ class Panel(QFrame):
         self.fit()
 
     def fit(self):
+        """Размер по содержимому, но не меньше, чем задал пользователь (растягивание за край/угол)."""
         self.adjustSize()
+        w, h = self.width(), self.height()
+        if self.user_w:
+            w = max(w, self.user_w)
+        if self.user_h and self.more_scroll.isVisible():
+            h = max(h, self.user_h)
+        self.resize(w, h)
         self.move(self.ov.clamp(QRect(self.pos(), self.size())).topLeft())
+
+    def _relayout_grid(self):
+        cols = max(3, min(8, (self.width() - 24) // 130))
+        if cols == self._cols:
+            return
+        self._cols = cols
+        for n, key in enumerate(self.boxes):
+            self.grid.addWidget(self.boxes[key], n // cols, n % cols)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._relayout_grid()
 
     def set_update_status(self, text, show_install=False, version=""):
         self.upd_status.setText(text)
@@ -1125,15 +1151,59 @@ class Panel(QFrame):
         b_dump.clicked.connect(ov.dump_api)
         v.addWidget(b_dump)
 
+    EDGE, CORNER = 8, 22
+
+    def _edges(self, pos):
+        """Какие края под курсором: (правый, нижний)."""
+        r = pos.x() > self.width() - self.EDGE
+        b = pos.y() > self.height() - self.EDGE
+        if pos.x() > self.width() - self.CORNER and pos.y() > self.height() - self.CORNER:
+            r = b = True
+        return r, b
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 220, 90, 230))
+        w, h, g = self.width() - 2, self.height() - 2, 16
+        p.drawPolygon([QPointF(w, h - g), QPointF(w, h), QPointF(w - g, h)])
+
     def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton and e.position().y() < 34:
+        if e.button() != Qt.LeftButton:
+            return
+        pos = e.position().toPoint()
+        r, b = self._edges(pos)
+        if r or b:
+            self._rs = (e.globalPosition().toPoint(), self.size(), r, b)
+        elif pos.y() < 34:
             self._drag = e.globalPosition().toPoint() - self.pos()
 
     def mouseMoveEvent(self, e):
-        if self._drag is not None:
+        if self._rs is not None:
+            start, size, r, b = self._rs
+            d = e.globalPosition().toPoint() - start
+            mn = self.minimumSizeHint()
+            w = size.width() + (d.x() if r else 0)
+            h = size.height() + (d.y() if b else 0)
+            w = max(mn.width(), min(w, self.ov.width() - self.x()))
+            h = max(mn.height(), min(h, self.ov.height() - self.y()))
+            self.resize(w, h)
+        elif self._drag is not None:
             self.move(self.ov.clamp(QRect(e.globalPosition().toPoint() - self._drag, self.size())).topLeft())
+        else:
+            r, b = self._edges(e.position().toPoint())
+            self.setCursor(Qt.SizeFDiagCursor if (r and b) else Qt.SizeHorCursor if r else
+                           Qt.SizeVerCursor if b else Qt.ArrowCursor)
 
     def mouseReleaseEvent(self, e):
+        if self._rs is not None:
+            self.user_w = self.width()
+            if self.more_scroll.isVisible():
+                self.user_h = self.height()
+            self.ov.cfg["panel_size"] = [self.user_w or 0, self.user_h or 0]
+        self._rs = None
         self._drag = None
 
 
