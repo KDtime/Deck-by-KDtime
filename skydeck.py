@@ -28,11 +28,12 @@ import threading
 import subprocess
 import urllib.request
 import traceback
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal, QRectF, QRect, QPointF, QTimer, QObject
-from PySide6.QtGui import (QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF,
+from PySide6.QtGui import (QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QPainterPath,
                            QIcon, QPixmap, QAction)
 from PySide6.QtWidgets import (QApplication, QWidget, QFrame, QSystemTrayIcon, QMenu,
                                QCheckBox, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -50,7 +51,7 @@ APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path
 APP_NAME = "SkyDeck"
 APP_AUTHOR = "KDtime"
 APP_TITLE = "%s by %s" % (APP_NAME, APP_AUTHOR)
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 EXE_NAME = APP_NAME + ".exe"
 # Репозиторий GitHub с файлом-обновлением, формат "логин/репозиторий" (или "update_repo" в конфиге).
 # Пусто - проверка обновлений отключена.
@@ -77,6 +78,9 @@ DEFAULT_CFG = {
     "g_zones": {"start": 2.0, "target": 3.0, "limit": 4.5, "good": "#50e682", "bad": "#ff6446"},
     "auto_update_check": True,
     "update_repo": "",
+    "profiles": {},               # тип самолёта -> {"g_zones": {...}, "ias_limit": км/ч}
+    "hz_inv_roll": False,
+    "hz_inv_pitch": False,
     "panel_size": [0, 0],         # размер панели настройки (0 - по содержимому)
     "poll_ms": 25,
     "poll_ms_idle": 1000,
@@ -96,7 +100,7 @@ def load_cfg():
     gz = dict(DEFAULT_CFG["g_zones"])
     gz.update(cfg.get("g_zones") if isinstance(cfg.get("g_zones"), dict) else {})
     cfg["g_zones"] = gz
-    for k in ("layout", "visible", "colors"):
+    for k in ("layout", "visible", "colors", "profiles"):
         if not isinstance(cfg.get(k), dict):
             cfg[k] = {}
     return cfg
@@ -260,6 +264,18 @@ def merge(state, ind):
                 d["chaff_n"] = v
             elif "bomb" in kl and ("bay" in kl or "door" in kl) and "bay_val" not in d:
                 d["bay_val"] = v
+    d["type"] = str(i.get("type", "") or "")
+    if s.get("Mfuel, kg") is not None:
+        d["fuel_kg"] = _f(s["Mfuel, kg"])
+    if "aviahorizon_roll" in i and "aviahorizon_pitch" in i:
+        d["hz_roll"], d["hz_pitch"] = _f(i["aviahorizon_roll"]), _f(i["aviahorizon_pitch"])
+    for key, pref in (("water", "water temp"), ("oil", "oil temp"), ("manifold", "manifold pressure"),
+                      ("prop", "pitch 1"), ("radiator", "radiator"), ("thrust", "thrust"),
+                      ("aos", "aos"), ("roll_rate", "wx")):
+        for k, v in s.items():
+            if str(k).lower().startswith(pref):
+                d[key] = _f(v)
+                break
     return d
 
 
@@ -277,6 +293,10 @@ def demo_data(t=None):
         "airbrake": (math.sin(t * 0.35) + 1) / 2,
         "smoke_val": 1 if math.sin(t * 0.5) > 0 else 0, "flare_n": 24, "chaff_n": 12,
         "bay_val": (math.sin(t * 0.4) + 1) / 2,
+        "type": "demo", "peak_g": 4.2, "flight_s": t % 3600, "fuel_left_s": 540.0,
+        "water": 95, "oil": 88, "manifold": 1.3, "prop": 45, "radiator": 30, "thrust": 1500,
+        "aos": math.sin(t) * 3, "roll_rate": math.sin(t * 0.5) * 80,
+        "hz_roll": math.sin(t * 0.4) * 35, "hz_pitch": math.sin(t * 0.3) * 12,
     }
 
 
@@ -345,6 +365,13 @@ def mix(c1, c2, t):
     return QColor(int(c1.red() + (c2.red() - c1.red()) * t),
                   int(c1.green() + (c2.green() - c1.green()) * t),
                   int(c1.blue() + (c2.blue() - c1.blue()) * t))
+
+
+def fmt_ms(sec):
+    if sec is None or _f(sec, -1) < 0:
+        return "-"
+    sec = int(sec)
+    return "%d:%02d" % (sec // 60, sec % 60)
 
 
 def g_color(g, base, z):
@@ -500,7 +527,13 @@ class GaugeWidget(HudWidget):
         if self.key == "thr":  # плавное покраснение: 100% -> 110% (малый -> полный форсаж)
             base = mix(base, C_BAD, (_f(self.d.get("thr_avg", 0)) - 1.0) / 0.10)
         elif self.key == "g":  # зоны перегрузки: приближение к цели - зеленеет, дальше - краснеет
-            base = g_color(self.d.get("ny", 1.0), base, self.ov.cfg.get("g_zones", {}))
+            prof = self.ov.profile()
+            base = g_color(self.d.get("ny", 1.0), base, prof.get("g_zones") or self.ov.cfg.get("g_zones", {}))
+        elif self.key == "ias":  # предел скорости из профиля самолёта: с 85% желтеет, на пределе краснеет
+            lim = _f(self.ov.profile().get("ias_limit", 0))
+            if lim > 0:
+                ratio = _f(self.d.get("ias", 0)) / lim
+                base = C_BAD if ratio >= 1.0 else mix(base, C_WARN, (ratio - 0.85) / 0.15)
         fit_text(p, txt, val, base)
 
 
@@ -709,6 +742,61 @@ class AoaWidget(HudWidget):
         fit_text(p, f"{a:.1f}°", QRectF(r.left(), bot + h * 0.06, w, h * 0.12), col)
 
 
+class HorizonWidget(HudWidget):
+    """Авиагоризонт (крен/тангаж из /indicators) и шарик скольжения (AoS из /state)."""
+
+    def draw(self, p, r):
+        roll, pitch = self.d.get("hz_roll"), self.d.get("hz_pitch")
+        if roll is None or pitch is None:
+            fit_text(p, "ГОРИЗОНТ: нет данных", QRectF(r.left() + 4, r.top() + 2, r.width() - 8, r.height() - 4), C_DIM)
+            return
+        if self.ov.cfg.get("hz_inv_roll"):
+            roll = -roll
+        if self.ov.cfg.get("hz_inv_pitch"):
+            pitch = -pitch
+        side = min(r.width(), r.height() * 0.88) - 6
+        R = side / 2
+        c = QPointF(r.center().x(), r.top() + 3 + R)
+        ppd = R / 30.0  # пикселей на градус тангажа
+        path = QPainterPath()
+        path.addEllipse(c, R, R)
+        p.save()
+        p.setClipPath(path)
+        p.translate(c)
+        p.rotate(-roll)
+        off = pitch * ppd
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(70, 140, 210))
+        p.drawRect(QRectF(-3 * R, -6 * R + off, 6 * R, 6 * R))
+        p.setBrush(QColor(120, 85, 50))
+        p.drawRect(QRectF(-3 * R, off, 6 * R, 6 * R))
+        p.setPen(QPen(QColor(255, 255, 255, 230), 2))
+        p.drawLine(QPointF(-3 * R, off), QPointF(3 * R, off))
+        for deg in (-30, -20, -10, 10, 20, 30):
+            y = off - deg * ppd
+            half = R * (0.30 if abs(deg) % 20 == 0 else 0.18)
+            p.setPen(QPen(QColor(255, 255, 255, 190), 1.5))
+            p.drawLine(QPointF(-half, y), QPointF(half, y))
+        p.restore()
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(C_LINE, 2))
+        p.drawEllipse(c, R, R)
+        p.setPen(QPen(QColor(255, 210, 60), 3))  # неподвижный силуэт самолёта
+        p.drawLine(QPointF(c.x() - R * 0.45, c.y()), QPointF(c.x() - R * 0.12, c.y()))
+        p.drawLine(QPointF(c.x() + R * 0.12, c.y()), QPointF(c.x() + R * 0.45, c.y()))
+        p.drawEllipse(c, 3, 3)
+        aos = self.d.get("aos")
+        if aos is not None:  # шарик скольжения
+            by = r.bottom() - r.height() * 0.06
+            half_w = R * 0.6
+            p.setPen(QPen(C_LINE, 2))
+            p.drawLine(QPointF(c.x() - half_w, by), QPointF(c.x() + half_w, by))
+            bx = c.x() + max(-1.0, min(1.0, _f(aos) / 10.0)) * half_w
+            p.setPen(Qt.NoPen)
+            p.setBrush(self.col(C_OK) if abs(_f(aos)) < 2.0 else C_WARN)
+            p.drawEllipse(QPointF(bx, by), 4, 4)
+
+
 class SmokeWidget(HudWidget):
     """Дым вкл/выкл. Работает, если игра отдаёт такое поле в API (ищем по имени 'smoke')."""
 
@@ -784,6 +872,17 @@ GAUGES = [
     ("power", "Мощность", "л.с.", lambda d: f"{d['power']:.0f}", px(190, 190, 150, 70), False),
     ("fuel", "Топливо", "%", lambda d: f"{d['fuel_pct']:.0f}", px(350, 190, 150, 70), False),
     ("thr", "РУД", "%", lambda d: f"{d['thr_avg'] * 100:.0f}", px(510, 190, 170, 70), False),
+    ("peak_g", "Пик G", "", lambda d: f"{d['peak_g']:.1f}", px(30, 270, 150, 70), False),
+    ("flight_t", "Время вылета", "", lambda d: fmt_ms(d.get("flight_s")), px(190, 270, 150, 70), False),
+    ("fuel_t", "Топлива хватит", "", lambda d: fmt_ms(d.get("fuel_left_s")), px(350, 270, 150, 70), False),
+    ("aos", "Скольжение", "°", lambda d: f"{d['aos']:+.1f}", px(510, 270, 170, 70), False),
+    ("roll_rate", "Скор. крена", "°/с", lambda d: f"{d['roll_rate']:.0f}", px(30, 350, 150, 70), False),
+    ("water", "Вода", "°C", lambda d: f"{d['water']:.0f}", px(190, 350, 150, 70), False),
+    ("oil", "Масло", "°C", lambda d: f"{d['oil']:.0f}", px(350, 350, 150, 70), False),
+    ("manifold", "Наддув", "атм", lambda d: f"{d['manifold']:.2f}", px(510, 350, 170, 70), False),
+    ("prop", "Шаг винта", "°", lambda d: f"{d['prop']:.0f}", px(30, 430, 150, 70), False),
+    ("radiator", "Радиатор", "%", lambda d: f"{d['radiator']:.0f}", px(190, 430, 150, 70), False),
+    ("thrust", "Тяга", "кгс", lambda d: f"{d['thrust']:.0f}", px(350, 430, 150, 70), False),
 ]
 SPECIAL = [
     ("gear", "Шасси", GearWidget, px(860, 930, 170, 120), True),
@@ -796,6 +895,7 @@ SPECIAL = [
     ("smoke", "Дым", SmokeWidget, px(1480, 990, 170, 56), False),
     ("cm", "ЛТЦ / диполи", CountersWidget, px(1480, 910, 170, 70), False),
     ("bay", "Бомболюк", BombBayWidget, px(1660, 910, 200, 70), False),
+    ("horizon", "Авиагоризонт", HorizonWidget, px(1500, 500, 230, 250), False),
 ]
 
 
@@ -1127,6 +1227,37 @@ class Panel(QFrame):
         v.addLayout(crow)
         v.addWidget(self._note("До «Начала» - обычный цвет виджета (ПКМ), к «Цели» зеленеет, к «Пределу» краснеет"))
 
+        v.addWidget(self._hdr("Профиль самолёта и вылет"))
+        self.type_label = QLabel("Самолёт: -")
+        v.addWidget(self.type_label)
+        irow = QHBoxLayout()
+        irow.addWidget(QLabel("Предел IAS, км/ч (0 - выкл)"))
+        self.sb_ias = QDoubleSpinBox()
+        self.sb_ias.setRange(0.0, 3000.0)
+        self.sb_ias.setDecimals(0)
+        self.sb_ias.setSingleStep(10.0)
+        irow.addWidget(self.sb_ias, 1)
+        v.addLayout(irow)
+        prow = QHBoxLayout()
+        b_sp = QPushButton("Сохранить профиль")
+        b_sp.setToolTip("Запомнить пороги G и предел IAS для самолёта, на котором летишь (нужен бой)")
+        b_sp.clicked.connect(ov.save_profile)
+        b_cp = QPushButton("Удалить профиль")
+        b_cp.clicked.connect(ov.clear_profile)
+        b_pk = QPushButton("Сбросить пик G")
+        b_pk.clicked.connect(ov.reset_peak)
+        for b in (b_sp, b_cp, b_pk):
+            prow.addWidget(b)
+        v.addLayout(prow)
+        v.addWidget(self._note("IAS желтеет с 85% предела и краснеет на пределе. Пороги G в профиле - из блока выше"))
+
+        v.addWidget(self._hdr("Авиагоризонт"))
+        for key, label in (("hz_inv_roll", "Инвертировать крен"), ("hz_inv_pitch", "Инвертировать тангаж")):
+            cb = QCheckBox(label)
+            cb.setChecked(bool(cfg.get(key, False)))
+            cb.toggled.connect(lambda on, k=key: ov.set_hz(k, on))
+            v.addWidget(cb)
+
         v.addWidget(self._hdr("Обновления"))
         v.addWidget(QLabel("Версия: %s" % APP_VERSION))
         self.btn_check = QPushButton("Проверить обновления")
@@ -1210,6 +1341,7 @@ class Panel(QFrame):
 # --------------------------------------------------------------- оверлей ---
 class Overlay(QWidget):
     HK_EDIT, HK_HIDE, HK_CENTER = 1, 2, 3
+    dump_done = Signal(str)
 
     def __init__(self, cfg):
         super().__init__()
@@ -1223,6 +1355,8 @@ class Overlay(QWidget):
         self._rtss_t = 0.0
         self.vx = self.vy = 0.0       # виртуальная ручка (режим «Мышь»)
         self._vdirty, self._vmove = False, 0.0
+        self._t0, self.peak_g = None, 0.0     # старт вылета, пик перегрузки
+        self._fuel_hist = deque()
         self.tray = None
         self.update_info = None
         self._manual_check = False
@@ -1250,6 +1384,7 @@ class Overlay(QWidget):
         self.panel.move(int(self.width() / 2 - self.panel.width() / 2), int(self.height() * 0.28))
         self.panel.hide()
 
+        self.dump_done.connect(lambda m: self.panel.msg.setText(m), Qt.QueuedConnection)
         self.updater = Updater(cfg)
         self.updater.checked.connect(self.on_update_checked, Qt.QueuedConnection)
         self.updater.progress.connect(lambda t: self.panel.set_update_status(t, False), Qt.QueuedConnection)
@@ -1364,19 +1499,36 @@ class Overlay(QWidget):
             self.set_color(key, old)
 
     def dump_api(self):
-        """Записать сырые /state и /indicators в файл - чтобы увидеть, какие поля есть у игры."""
+        """Записать сырые данные игры в файл: /state, /indicators и карту, миссию, события, чат."""
         raw = getattr(self, "last_raw", None)
         if not raw or (raw[0] is None and raw[1] is None):
             self.panel.msg.setText("Нет данных: игра не запущена или нет боя.")
             return
+        self.panel.msg.setText("Собираю дамп...")
+        threading.Thread(target=self._dump_worker, args=(raw,), daemon=True).start()
+
+    def _dump_worker(self, raw):
+        extra = {}
+        for name, path in (("map_obj", "/map_obj.json"), ("map_info", "/map_info.json"),
+                           ("mission", "/mission.json"), ("hudmsg", "/hudmsg?lastEvt=0&lastDmg=0"),
+                           ("gamechat", "/gamechat?lastId=0")):
+            try:
+                with urllib.request.urlopen("http://%s:%d%s" % (WT_HOST, WT_PORT, path), timeout=1.5) as r:
+                    txt = r.read(600000).decode("utf-8", "replace")
+                try:
+                    extra[name] = json.loads(txt)
+                except Exception:
+                    extra[name] = txt[:20000]
+            except Exception as e:
+                extra[name] = "ошибка: %s" % e
         path = APP_DIR / "api_dump.json"
         try:
-            path.write_text(json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                        "state": raw[0], "indicators": raw[1]},
-                                       ensure_ascii=False, indent=2), encoding="utf-8")
-            self.panel.msg.setText("Сохранено: " + str(path))
+            data = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "state": raw[0], "indicators": raw[1]}
+            data.update(extra)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.dump_done.emit("Сохранено: %s" % path)
         except Exception as e:
-            self.panel.msg.setText("Ошибка записи: %s" % e)
+            self.dump_done.emit("Ошибка записи: %s" % e)
 
     def calibrate_axes(self):
         """Запомнить текущее положение ручки и педалей как ноль (делать в бою, ручка в центре)."""
@@ -1478,6 +1630,7 @@ class Overlay(QWidget):
         if d.get("_raw"):
             self.last_raw = d["_raw"]
         if d.get("in_flight"):
+            self._derive(d)
             self._miss, self.data = 0, d
         else:
             self._miss += 1
@@ -1485,9 +1638,12 @@ class Overlay(QWidget):
         if live != self.live:
             if live:
                 self.vx = self.vy = 0.0  # новый вылет - ручка в центр
+                self._t0, self.peak_g = None, 0.0
+                self._fuel_hist.clear()
             self.live = live
             self.refresh_visibility()
         if self.panel.isVisible():
+            self.panel.type_label.setText("Самолёт: %s" % (self.cur_type() or "-"))
             state = "в бою" if self.live else ("игра запущена, ждём бой" if d.get("online") else "игра не найдена - демо")
             self.panel.status.setText(f"Связь: {state}   {d.get('_hz', 0):.0f} Гц  {d.get('_ping', 0):.0f} мс")
         if self.live:
@@ -1561,6 +1717,53 @@ class Overlay(QWidget):
         self.cfg["g_zones"][key] = hexcolor
         self.panel._paint_btn(self.panel.b_gc_good if key == "good" else self.panel.b_gc_bad, hexcolor)
         self.widgets["g"].update()
+
+    def cur_type(self):
+        return str(self.data.get("type") or "") if self.live else ""
+
+    def profile(self):
+        return self.cfg["profiles"].get(self.cur_type(), {}) if self.live else {}
+
+    def save_profile(self):
+        t = self.cur_type()
+        if not t:
+            self.panel.msg.setText("Нужен бой: тип самолёта известен только из игры.")
+            return
+        self.cfg["profiles"][t] = {"g_zones": dict(self.cfg["g_zones"]),
+                                   "ias_limit": float(self.panel.sb_ias.value())}
+        self.panel.msg.setText("Профиль сохранён для: %s" % t)
+        self.update_all()
+
+    def clear_profile(self):
+        t = self.cur_type()
+        if t and self.cfg["profiles"].pop(t, None) is not None:
+            self.panel.msg.setText("Профиль удалён: %s" % t)
+        else:
+            self.panel.msg.setText("Для этого самолёта профиля нет.")
+        self.update_all()
+
+    def reset_peak(self):
+        self.peak_g = 0.0
+        self._t0 = None
+
+    def set_hz(self, key, on):
+        self.cfg[key] = bool(on)
+        self.widgets["horizon"].update()
+
+    def _derive(self, d):
+        """Считаем то, чего нет в API: пик G, время вылета, запас топлива по времени."""
+        now = time.perf_counter()
+        if self._t0 is None:
+            self._t0 = now
+        self.peak_g = max(self.peak_g, abs(_f(d.get("ny", 1.0))))
+        d["peak_g"], d["flight_s"] = self.peak_g, now - self._t0
+        fk = d.get("fuel_kg")
+        if fk is not None:
+            self._fuel_hist.append((now, fk))
+            while self._fuel_hist and now - self._fuel_hist[0][0] > 15.0:
+                self._fuel_hist.popleft()
+            t0, f0 = self._fuel_hist[0]
+            d["fuel_left_s"] = (fk / ((f0 - fk) / (now - t0))) if (now - t0 >= 3.0 and f0 - fk > 0.01) else None
 
     def set_auto_update(self, on):
         self.cfg["auto_update_check"] = bool(on)
